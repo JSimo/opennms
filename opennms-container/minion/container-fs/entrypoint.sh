@@ -211,10 +211,12 @@ configure() {
     export JAVA_OPTS="$JAVA_OPTS -javaagent:${MINION_HOME}/agent/jacoco-agent.jar=output=none,jmx=true,excludes=org.drools.*"
   fi
   if [[ -f "$MINION_PROCESS_ENV_CFG" ]]; then
+    original_java_opts=$JAVA_OPTS
     while read assignment; do
       [[ $assignment =~ ^#.* ]] && continue
       export "$assignment"
     done < "$MINION_PROCESS_ENV_CFG"
+    export JAVA_OPTS="$original_java_opts $JAVA_OPTS"
   fi
   if [[ -f "$MINION_SERVER_CERTS_CFG" ]]; then
     # cacerts is a symlink to a file, so *do not* put /. on the target
