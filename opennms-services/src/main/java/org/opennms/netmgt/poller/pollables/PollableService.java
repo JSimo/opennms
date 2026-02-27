@@ -424,14 +424,24 @@ public class PollableService extends PollableElement implements ReadyRunnable, M
             LOG.debug("Start Scheduled Poll of service {}", this);
             PollStatus status;
             if (getContext().isNodeProcessingEnabled()) {
-                PollRunner r = new PollRunner();
+                // PHASE 1: Poll WITHOUT the lock (network I/O happens here)
+                // This is the key optimization - we don't hold the tree lock during network I/O
+                PollStatus pollResult = doPollWithoutTreeLock();
+                
+                // PHASE 2: Acquire lock ONLY for status update and event processing
+                // The lock is held only for the brief state update, not during network I/O
                 try {
-                    withTreeLock(r, timeout);
+                    withTreeLock(() -> {
+                        m_preemptivePollStatus = pollResult;
+                        doPoll();
+                        getNode().processStatusChange(new Date());
+                        m_preemptivePollStatus = null;
+                    }, timeout);
                 } catch (LockUnavailable e) {
                     LOG.trace("Postponing poll for {}. Another service is currently holding the lock.", this);
                     throw new PostponeNecessary("LockUnavailable postpone poll");
                 }
-                status = r.getPollStatus();
+                status = getStatus();
             }
             else {
                 doPoll();
@@ -443,6 +453,17 @@ public class PollableService extends PollableElement implements ReadyRunnable, M
         } finally {
             Logging.setContextMap(mdc);
         }
+    }
+
+    /**
+     * Polls the service without acquiring the tree lock.
+     * This allows network I/O to happen outside of lock contention,
+     * significantly reducing lock hold time and improving throughput.
+     * 
+     * @return the poll status from the network poll
+     */
+    private PollStatus doPollWithoutTreeLock() {
+        return m_pollConfig.poll();
     }
 
 	/**

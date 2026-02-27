@@ -39,6 +39,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
@@ -129,6 +130,8 @@ public class SnmpPeerFactory implements SnmpAgentConfigFactory {
 
     private final SnmpAddressCache m_addressCache = new SnmpAddressCacheImpl();
 
+    private final ConcurrentHashMap<String, Definition> m_definitionCache = new ConcurrentHashMap<>();
+
     /**
      * Identity-based cache for parsed IP addresses. Uses WeakHashMap so entries
      * are automatically cleaned up when Definition/Range objects are garbage
@@ -202,6 +205,7 @@ public class SnmpPeerFactory implements SnmpAgentConfigFactory {
                 m_callback = new FileReloadCallback<SnmpConfig>() {
                     @Override
                     public SnmpConfig reload(final SnmpConfig object, final Resource resource) throws IOException {
+                        m_definitionCache.clear();
                         return JaxbUtils.unmarshal(SnmpConfig.class, resource);
                     }
                 };
@@ -437,12 +441,30 @@ public class SnmpPeerFactory implements SnmpAgentConfigFactory {
             // Now set the defaults from the getSnmpConfig()
             setSnmpAgentConfig(agentConfig, new Definition(), requestedSnmpVersion);
 
-            // Set the values from best matching definition
-            final AddressSnmpConfigVisitor visitor = new AddressSnmpConfigVisitor(agentInetAddress, location, m_addressCache);
-            getSnmpConfig().visit(visitor);
-            final Definition matchingDef = visitor.getDefinition();
-            // Is agent config matching specific definition or coming from default config
-            if (!visitor.isMatchingDefaultConfig()) {
+            // Cached lookup for matching definition
+            String effectiveLocation = LocationUtils.getEffectiveLocationName(location);
+            String cacheKey = InetAddressUtils.str(agentInetAddress) + "|" + effectiveLocation;
+            
+            Definition matchingDef = m_definitionCache.get(cacheKey);
+            boolean isMatchingDefault = true;
+            
+            if (matchingDef == null) {
+                // Cache miss - do full lookup
+                final AddressSnmpConfigVisitor visitor = new AddressSnmpConfigVisitor(agentInetAddress, location, m_addressCache);
+                getSnmpConfig().visit(visitor);
+                matchingDef = visitor.getDefinition();
+                isMatchingDefault = visitor.isMatchingDefaultConfig();
+                
+                // Only cache when we matched a specific definition (not defaults)
+                if (matchingDef != null && !isMatchingDefault) {
+                    m_definitionCache.put(cacheKey, matchingDef);
+                }
+            } else {
+                // Cache hit - we only cache specific definitions, so this is non-default
+                isMatchingDefault = false;
+            }
+
+            if (!isMatchingDefault) {
                 agentConfig.setDefault(false);
             }
             if (matchingDef != null) {
@@ -597,6 +619,7 @@ public class SnmpPeerFactory implements SnmpAgentConfigFactory {
     public void saveDefinition(final Definition definition) {
         getWriteLock().lock();
         try {
+            m_definitionCache.clear();
             final SnmpConfigManager mgr = new SnmpConfigManager(getSnmpConfig());
             mgr.mergeIntoConfig(definition);
         } finally {
@@ -609,6 +632,7 @@ public class SnmpPeerFactory implements SnmpAgentConfigFactory {
         boolean succeeded = false;
         getWriteLock().lock();
         try {
+            m_definitionCache.clear();
             // Check if there is a matching definition from the config itself instead of doing getAgentConfig.
             Definition matchingDefinition = findMatchingDefinition(inetAddress, location);
             if (matchingDefinition != null) {

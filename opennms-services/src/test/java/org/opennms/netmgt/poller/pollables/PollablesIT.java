@@ -2598,6 +2598,100 @@ public class PollablesIT {
 
     }
 
+    /**
+     * Test that concurrent polls on different services of the same node
+     * can proceed in parallel. This verifies that the network I/O phase
+     * (phase 1) does not hold the tree lock, allowing multiple services
+     * to poll concurrently.
+     * 
+     * Before the fix (NMS-XXXXX), network I/O was done while holding the
+     * tree lock, causing all polls on the same node to serialize.
+     * After the fix, the network I/O happens outside the lock, and only
+     * the status update phase holds the lock briefly.
+     */
+    @Test
+    public void testConcurrentPollsOnSameNodeDontBlock() throws Exception {
+        final long POLL_DELAY_MS = 200;
+        final AtomicInteger concurrentPolls = new AtomicInteger(0);
+        final AtomicInteger maxConcurrentPolls = new AtomicInteger(0);
+        final AtomicBoolean testFailed = new AtomicBoolean(false);
+        
+        // Create mock poll configs that track concurrent polls with a delay
+        PollableServiceConfig mockConfig1 = createDelayedMockPollConfig(POLL_DELAY_MS, concurrentPolls, maxConcurrentPolls);
+        PollableServiceConfig mockConfig2 = createDelayedMockPollConfig(POLL_DELAY_MS, concurrentPolls, maxConcurrentPolls);
+        
+        // Set up the mock configs on two services on the same node
+        pDot1Smtp.setPollConfig(mockConfig1);
+        pDot1Icmp.setPollConfig(mockConfig2);
+        
+        // Run both polls concurrently
+        Thread[] threads = new Thread[2];
+        threads[0] = new Thread(() -> {
+            try {
+                pDot1Smtp.doRun();
+            } catch (Exception e) {
+                LOG.error("Poll 1 failed", e);
+                testFailed.set(true);
+            }
+        });
+        threads[1] = new Thread(() -> {
+            try {
+                pDot1Icmp.doRun();
+            } catch (Exception e) {
+                LOG.error("Poll 2 failed", e);
+                testFailed.set(true);
+            }
+        });
+        
+        long startTime = System.currentTimeMillis();
+        
+        threads[0].start();
+        threads[1].start();
+        
+        threads[0].join();
+        threads[1].join();
+        
+        long elapsedTime = System.currentTimeMillis() - startTime;
+        
+        assertFalse("Test failed with exception", testFailed.get());
+        
+        // Verify that polls ran concurrently (max concurrent should be 2)
+        // If the old locking behavior was still in place, maxConcurrentPolls would be 1
+        LOG.info("Max concurrent polls observed: {}", maxConcurrentPolls.get());
+        LOG.info("Total elapsed time: {}ms (expected ~{}ms if concurrent, ~{}ms if serial)", 
+                 elapsedTime, POLL_DELAY_MS, POLL_DELAY_MS * 2);
+        
+        // With the fix, both polls should run concurrently during the network I/O phase
+        // The total time should be approximately POLL_DELAY_MS, not 2 * POLL_DELAY_MS
+        // Allow some margin for thread scheduling overhead
+        assertTrue("Polls should complete in approximately " + POLL_DELAY_MS + "ms when running concurrently, " +
+                   "but took " + elapsedTime + "ms. This suggests polls are blocking each other.",
+                   elapsedTime < POLL_DELAY_MS * 1.8);
+        
+        // Verify we actually saw concurrent execution
+        assertEquals("Expected to see 2 concurrent polls during network I/O phase", 
+                     2, maxConcurrentPolls.get());
+    }
+    
+    private PollableServiceConfig createDelayedMockPollConfig(final long delayMs, 
+                                                              final AtomicInteger concurrentPolls,
+                                                              final AtomicInteger maxConcurrentPolls) {
+        PollableServiceConfig mockConfig = mock(PollableServiceConfig.class);
+        when(mockConfig.poll()).thenAnswer(invocation -> {
+            int current = concurrentPolls.incrementAndGet();
+            maxConcurrentPolls.updateAndGet(max -> Math.max(max, current));
+            try {
+                Thread.sleep(delayMs);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            concurrentPolls.decrementAndGet();
+            return PollStatus.up();
+        });
+        when(mockConfig.getCurrentTime()).thenReturn(System.currentTimeMillis());
+        return mockConfig;
+    }
+
     private void assertTime(long time) {
         assertEquals("Unexpected time", time, m_scheduler.getCurrentTime());
     }
