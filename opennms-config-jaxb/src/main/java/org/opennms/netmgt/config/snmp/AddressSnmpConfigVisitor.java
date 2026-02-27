@@ -59,6 +59,7 @@ public class AddressSnmpConfigVisitor extends AbstractSnmpConfigVisitor implemen
 
     private final InetAddress m_address;
     private final String m_location;
+    private final SnmpAddressCache m_addressCache;
 
     private SnmpConfig m_currentConfig;
     private Definition m_currentDefinition;
@@ -75,12 +76,17 @@ public class AddressSnmpConfigVisitor extends AbstractSnmpConfigVisitor implemen
     private String m_matchingProfileLabelAtGivenLocation;
 
     public AddressSnmpConfigVisitor(final InetAddress addr) {
-        this(addr, null);
+        this(addr, null, null);
     }
 
     public AddressSnmpConfigVisitor(final InetAddress addr, final String location) {
+        this(addr, location, null);
+    }
+
+    public AddressSnmpConfigVisitor(final InetAddress addr, final String location, final SnmpAddressCache addressCache) {
         m_address = addr;
         m_location = LocationUtils.getEffectiveLocationName(location);
+        m_addressCache = addressCache;
     }
 
     @Override
@@ -139,16 +145,24 @@ public class AddressSnmpConfigVisitor extends AbstractSnmpConfigVisitor implemen
     public void visitSpecifics(final List<String> specifics) {
         if (!shouldTryToMatch()) return;
 
-        for (final String saddr : specifics) {
-            try {
-                final InetAddress addr = InetAddressUtils.addr(saddr);
-                if (addr != null && addr.equals(m_address)) {
-                    //LOG.debug("{} == {}", addr, m_address);
+        if (m_addressCache != null) {
+            for (final InetAddress addr : m_addressCache.getParsedSpecifics(m_currentDefinition)) {
+                if (addr.equals(m_address)) {
                     handleMatch();
                     return;
                 }
-            } catch (final IllegalArgumentException e) {
-                LOG.info("Error while reading SNMP config <specific> tag: {}", saddr, e);
+            }
+        } else {
+            for (final String saddr : specifics) {
+                try {
+                    final InetAddress addr = InetAddressUtils.addr(saddr);
+                    if (addr != null && addr.equals(m_address)) {
+                        handleMatch();
+                        return;
+                    }
+                } catch (final IllegalArgumentException e) {
+                    LOG.info("Error while reading SNMP config <specific> tag: {}", saddr, e);
+                }
             }
         }
     }
@@ -160,9 +174,17 @@ public class AddressSnmpConfigVisitor extends AbstractSnmpConfigVisitor implemen
 
         for (final Range range : ranges) {
             final byte[] addr = m_address.getAddress();
-            final byte[] begin = InetAddressUtils.toIpAddrBytes(range.getBegin());
-            final byte[] end = InetAddressUtils.toIpAddrBytes(range.getEnd());
-    
+            final byte[] begin;
+            final byte[] end;
+
+            if (m_addressCache != null) {
+                begin = m_addressCache.getParsedBegin(range);
+                end = m_addressCache.getParsedEnd(range);
+            } else {
+                begin = InetAddressUtils.toIpAddrBytes(range.getBegin());
+                end = InetAddressUtils.toIpAddrBytes(range.getEnd());
+            }
+
             final boolean inRange;
             if (BYTE_ARRAY_COMPARATOR.compare(begin, end) <= 0) {
                 inRange = InetAddressUtils.isInetAddressInRange(addr, begin, end);

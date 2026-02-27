@@ -35,7 +35,11 @@ import java.io.Writer;
 import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.WeakHashMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
@@ -59,6 +63,7 @@ import org.opennms.netmgt.config.snmp.AddressSnmpConfigVisitor;
 import org.opennms.netmgt.config.snmp.Configuration;
 import org.opennms.netmgt.config.snmp.Definition;
 import org.opennms.netmgt.config.snmp.Range;
+import org.opennms.netmgt.config.snmp.SnmpAddressCache;
 import org.opennms.netmgt.config.snmp.SnmpConfig;
 import org.opennms.netmgt.config.snmp.SnmpProfile;
 import org.opennms.netmgt.snmp.SnmpAgentConfig;
@@ -123,6 +128,68 @@ public class SnmpPeerFactory implements SnmpAgentConfigFactory {
 
     private static Scope secureCredentialsVaultScope;
 
+    private final SnmpAddressCache m_addressCache = new SnmpAddressCacheImpl();
+
+    private final ConcurrentHashMap<String, Definition> m_definitionCache = new ConcurrentHashMap<>();
+
+    /**
+     * Identity-based cache for parsed IP addresses. Uses WeakHashMap so entries
+     * are automatically cleaned up when Definition/Range objects are garbage
+     * collected after config reload.
+     */
+    private final class SnmpAddressCacheImpl implements SnmpAddressCache {
+        private final Map<Definition, List<InetAddress>> m_specificsCache =
+            Collections.synchronizedMap(new WeakHashMap<>());
+        private final Map<Range, byte[]> m_beginCache =
+            Collections.synchronizedMap(new WeakHashMap<>());
+        private final Map<Range, byte[]> m_endCache =
+            Collections.synchronizedMap(new WeakHashMap<>());
+
+        @Override
+        public List<InetAddress> getParsedSpecifics(Definition def) {
+            List<InetAddress> cached = m_specificsCache.get(def);
+            if (cached != null) {
+                return cached;
+            }
+            List<InetAddress> result = new ArrayList<>();
+            for (String addr : def.getSpecifics()) {
+                try {
+                    InetAddress parsed = InetAddressUtils.addr(addr);
+                    if (parsed != null) {
+                        result.add(parsed);
+                    }
+                } catch (IllegalArgumentException e) {
+                    LOG.info("Error while parsing SNMP config specific: {}", addr, e);
+                }
+            }
+            result = Collections.unmodifiableList(result);
+            m_specificsCache.put(def, result);
+            return result;
+        }
+
+        @Override
+        public byte[] getParsedBegin(Range range) {
+            byte[] cached = m_beginCache.get(range);
+            if (cached != null) {
+                return cached;
+            }
+            byte[] result = InetAddressUtils.toIpAddrBytes(range.getBegin());
+            m_beginCache.put(range, result);
+            return result;
+        }
+
+        @Override
+        public byte[] getParsedEnd(Range range) {
+            byte[] cached = m_endCache.get(range);
+            if (cached != null) {
+                return cached;
+            }
+            byte[] result = InetAddressUtils.toIpAddrBytes(range.getEnd());
+            m_endCache.put(range, result);
+            return result;
+        }
+    }
+
     /**
      * <p>Constructor for SnmpPeerFactory.</p>
      *
@@ -138,6 +205,7 @@ public class SnmpPeerFactory implements SnmpAgentConfigFactory {
                 m_callback = new FileReloadCallback<SnmpConfig>() {
                     @Override
                     public SnmpConfig reload(final SnmpConfig object, final Resource resource) throws IOException {
+                        m_definitionCache.clear();
                         return JaxbUtils.unmarshal(SnmpConfig.class, resource);
                     }
                 };
@@ -322,7 +390,7 @@ public class SnmpPeerFactory implements SnmpAgentConfigFactory {
 
     public SnmpAgentConfig getAgentConfigFromProfile(SnmpProfile snmpProfile, InetAddress address, final boolean metaDataInterpolation) {
         final SnmpAgentConfig agentConfig = new SnmpAgentConfig(address);
-        AddressSnmpConfigVisitor visitor = new AddressSnmpConfigVisitor(address);
+        AddressSnmpConfigVisitor visitor = new AddressSnmpConfigVisitor(address, null, m_addressCache);
         // Need to populate default snmp config.
         visitor.visitSnmpConfig(getSnmpConfig());
         snmpProfile.visit(visitor);
@@ -373,12 +441,30 @@ public class SnmpPeerFactory implements SnmpAgentConfigFactory {
             // Now set the defaults from the getSnmpConfig()
             setSnmpAgentConfig(agentConfig, new Definition(), requestedSnmpVersion);
 
-            // Set the values from best matching definition
-            final AddressSnmpConfigVisitor visitor = new AddressSnmpConfigVisitor(agentInetAddress, location);
-            getSnmpConfig().visit(visitor);
-            final Definition matchingDef = visitor.getDefinition();
-            // Is agent config matching specific definition or coming from default config
-            if (!visitor.isMatchingDefaultConfig()) {
+            // Cached lookup for matching definition
+            String effectiveLocation = LocationUtils.getEffectiveLocationName(location);
+            String cacheKey = InetAddressUtils.str(agentInetAddress) + "|" + effectiveLocation;
+            
+            Definition matchingDef = m_definitionCache.get(cacheKey);
+            boolean isMatchingDefault = true;
+            
+            if (matchingDef == null) {
+                // Cache miss - do full lookup
+                final AddressSnmpConfigVisitor visitor = new AddressSnmpConfigVisitor(agentInetAddress, location, m_addressCache);
+                getSnmpConfig().visit(visitor);
+                matchingDef = visitor.getDefinition();
+                isMatchingDefault = visitor.isMatchingDefaultConfig();
+                
+                // Only cache when we matched a specific definition (not defaults)
+                if (matchingDef != null && !isMatchingDefault) {
+                    m_definitionCache.put(cacheKey, matchingDef);
+                }
+            } else {
+                // Cache hit - we only cache specific definitions, so this is non-default
+                isMatchingDefault = false;
+            }
+
+            if (!isMatchingDefault) {
                 agentConfig.setDefault(false);
             }
             if (matchingDef != null) {
@@ -533,6 +619,7 @@ public class SnmpPeerFactory implements SnmpAgentConfigFactory {
     public void saveDefinition(final Definition definition) {
         getWriteLock().lock();
         try {
+            m_definitionCache.clear();
             final SnmpConfigManager mgr = new SnmpConfigManager(getSnmpConfig());
             mgr.mergeIntoConfig(definition);
         } finally {
@@ -545,6 +632,7 @@ public class SnmpPeerFactory implements SnmpAgentConfigFactory {
         boolean succeeded = false;
         getWriteLock().lock();
         try {
+            m_definitionCache.clear();
             // Check if there is a matching definition from the config itself instead of doing getAgentConfig.
             Definition matchingDefinition = findMatchingDefinition(inetAddress, location);
             if (matchingDefinition != null) {

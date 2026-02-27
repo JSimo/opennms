@@ -201,6 +201,11 @@ public class Definition extends Configuration implements Serializable {
             }
         } else if (!m_location.equals(other.m_location)) {
             return false;
+        }
+        if (m_profileLabel == null) {
+            if (other.m_profileLabel != null) {
+                return false;
+            }
         } else if (!m_profileLabel.equals(other.m_profileLabel)) {
             return false;
         }
