@@ -21,13 +21,9 @@
  */
 package org.opennms.netmgt.scheduler;
 
-import java.math.BigDecimal;
-import java.math.RoundingMode;
-import java.util.Comparator;
+import java.util.concurrent.DelayQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.PriorityBlockingQueue;
-import java.util.concurrent.ThreadPoolExecutor;
 
 import org.opennms.core.concurrent.LogPreservingThreadFactory;
 import org.opennms.core.fiber.PausableFiber;
@@ -38,18 +34,19 @@ public class LegacyPriorityExecutor implements PausableFiber {
 
     private static final Logger LOG = LoggerFactory.getLogger(LegacyPriorityExecutor.class);
 
+    private static final long BASE_DELAY_MS = 1000;
+    private static final long MAX_DELAY_MS = 60000;
+
     private final String m_parent;
     private final ExecutorService priorityJobPoolExecutor;
-    private final PriorityBlockingQueue<PriorityReadyRunnable> priorityQueue;
+    private final DelayQueue<PriorityReadyRunnable> priorityQueue;
     private final ExecutorService m_worker = Executors.newSingleThreadExecutor();
     private volatile int m_status;
     public LegacyPriorityExecutor(String parent, Integer poolSize, Integer queueSize) {
         m_parent=parent;
         m_status = START_PENDING;
         priorityJobPoolExecutor = Executors.newFixedThreadPool(poolSize, new LogPreservingThreadFactory(parent, poolSize));
-        priorityQueue = new PriorityBlockingQueue<>(
-                queueSize,
-                Comparator.comparing(PriorityReadyRunnable::getPriority));
+        priorityQueue = new DelayQueue<>();
     }
 
     public synchronized void addPriorityReadyRunnable(PriorityReadyRunnable job) {
@@ -85,7 +82,6 @@ public class LegacyPriorityExecutor implements PausableFiber {
 
             while (true) {
                 try {
-                    LOG.debug("Taking");
                     PriorityReadyRunnable executable = priorityQueue.take();
                     LOG.debug("Taked: {}", executable.getInfo());
                     while (m_status == PAUSE_PENDING || m_status == PAUSED) {
@@ -106,16 +102,12 @@ public class LegacyPriorityExecutor implements PausableFiber {
                         m_status = RUNNING;
                     }
                     if (executable.isReady()) {
+                        executable.setPriority(0);
+                        executable.setDelayUntil(0);
                         priorityJobPoolExecutor.execute(executable);
-                        LOG.debug("run: added to priority job executor thread pool: {}", executable.getInfo());
-                        if (priorityJobPoolExecutor instanceof ThreadPoolExecutor) {
-                            ThreadPoolExecutor e = (ThreadPoolExecutor) priorityJobPoolExecutor;
-                            String ratio = String.format("%.3f",e.getTaskCount() > 0 ? BigDecimal.valueOf(e.getCompletedTaskCount()).divide(BigDecimal.valueOf(e.getTaskCount()), 2, RoundingMode.DOWN) : 0) ;
-                            LOG.debug("thread pool statistics: activeCount={}, taskCount={}, completedTaskCount={}, completedRatio={}, poolSize={}",
-                                    e.getActiveCount(), e.getTaskCount(), e.getCompletedTaskCount(), ratio, e.getPoolSize());
-                        }
                     } else {
                         executable.setPriority(executable.getPriority() + 1);
+                        executable.applyBackoffDelay(BASE_DELAY_MS, MAX_DELAY_MS);
                         addPriorityReadyRunnable(executable);
                     }
                 } catch (InterruptedException e) {

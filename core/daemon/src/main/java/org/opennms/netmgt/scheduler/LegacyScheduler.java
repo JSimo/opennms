@@ -428,12 +428,11 @@ public class LegacyScheduler implements Runnable, PausableFiber, Scheduler {
                                 // Increment the execution counter
                                 ++m_numTasksExecuted;
 
-                                // Thread Pool Statistics
-                                if (m_runner instanceof ThreadPoolExecutor) {
+                                if (LOG.isDebugEnabled() && m_runner instanceof ThreadPoolExecutor) {
                                     ThreadPoolExecutor e = (ThreadPoolExecutor) m_runner;
-                                    String ratio = String.format("%.3f", e.getTaskCount() > 0 ? new Double(e.getCompletedTaskCount())/new Double(e.getTaskCount()) : 0);
+                                    String ratio = String.format("%.3f", e.getTaskCount() > 0 ? (double) e.getCompletedTaskCount() / e.getTaskCount() : 0);
                                     LOG.debug("thread pool statistics: activeCount={}, taskCount={}, completedTaskCount={}, completedRatio={}, poolSize={}",
-                                        e.getActiveCount(), e.getTaskCount(), e.getCompletedTaskCount(), ratio, e.getPoolSize());
+                                         e.getActiveCount(), e.getTaskCount(), e.getCompletedTaskCount(), ratio, e.getPoolSize());
                                 }
                             }
                         } catch (InterruptedException e) {
