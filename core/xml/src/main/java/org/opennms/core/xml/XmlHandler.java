@@ -46,6 +46,13 @@ public class XmlHandler<U> {
     private final Unmarshaller unmarshaller;
 
     public XmlHandler(Class<U> clazz) {
+        this(clazz, false);
+    }
+
+    /**
+     * @param compactWireMarshaller when true, use a compact marshaller without schema (for XML RPC/sink payloads).
+     */
+    public XmlHandler(Class<U> clazz, boolean compactWireMarshaller) {
         this.clazz = clazz;
         JAXBContext context;
         try {
@@ -53,7 +60,13 @@ public class XmlHandler<U> {
         } catch (JAXBException e) {
             throw new RuntimeException(e);
         }
-        this.marshaller = JaxbUtils.getMarshallerFor(clazz, context);
+        try {
+            this.marshaller = compactWireMarshaller
+                    ? JaxbUtils.createWireMarshaller(context)
+                    : JaxbUtils.getMarshallerFor(clazz, context);
+        } catch (JAXBException e) {
+            throw new RuntimeException(e);
+        }
         this.unmarshaller = JaxbUtils.getUnmarshallerFor(clazz, context, false);
         // Use the same event handler that we use in JaxbUtils
         try {
