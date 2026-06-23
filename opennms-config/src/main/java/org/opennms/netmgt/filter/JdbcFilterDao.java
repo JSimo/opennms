@@ -38,6 +38,7 @@ import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.regex.Pattern;
 
 import javax.annotation.PreDestroy;
 import javax.sql.DataSource;
@@ -319,7 +320,12 @@ public class JdbcFilterDao implements FilterDao, InitializingBean {
             	}
             }
             if (filterByAddress) {
-                sqlString += " AND ipInterface.ipaddr = ?";
+                // Restrict primary table by ipaddr in a subquery so the planner applies the filter before
+                // joining to assets/node, avoiding a full-table join on larger OpenNMS instances.
+                final String primaryTableName = m_databaseSchemaConfigFactory.getPrimaryTable().getName();
+                final String fromPrimary = "FROM " + primaryTableName + " ";
+                final String fromSubquery = "FROM (SELECT * FROM " + primaryTableName + " WHERE ipaddr = ?) " + primaryTableName + " ";
+                sqlString = sqlString.replaceFirst(Pattern.quote(fromPrimary), fromSubquery);
             }
 
             conn = getDataSource().getConnection();
