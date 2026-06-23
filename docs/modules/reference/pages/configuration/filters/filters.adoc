@@ -18,8 +18,31 @@ A `<join>` tag tells the filter module how to relate this table to the ipinterfa
 
 === Operators
 
-You can use C/Java-style comparison operators with data types they apply to.
-(You can use `==` and `!=` on strings, as well as the SQL `LIKE` keyword.)
+Filter rules use a defined grammar; they are not arbitrary SQL.
+Only the operators and shorthands listed below are supported.
+
+String comparisons use `==` and `!=` (translated to `=` and `!=` in SQL).
+You can also use the SQL `LIKE`, `NOT LIKE`, `IN (...)`, `NOT IN (...)`, `IS NULL`, `IS NOT NULL`, and `IS [NOT] DISTINCT FROM` operators.
+PostgreSQL type casts `::TIMESTAMP` and `::INET` may be applied to column references (for example, `ipAddr::INET`).
+
+==== Supported grammar summary
+
+[options="header", cols="1,2"]
+|===
+| Construct | Examples
+| Boolean AND / OR / NOT | `&`, `|`, `!` (also `&&`, `||`)
+| String comparison | `ipAddr == '10.0.0.1'`, `IPADDR != '0.0.0.0'`
+| Pattern match | `nodeSysOID LIKE '.1.3.6.1.4.1.9.%'`
+| Membership | `serviceName IN ('ICMP')`, `serviceName NOT IN ('ICMP', 'SNMP')`
+| Null checks | `categoryName IS NULL`, `categoryName IS NOT NULL`
+| Distinct comparison | `nodeLabel IS DISTINCT FROM 'other'`
+| IP matching | `IPADDR IPLIKE 192.168.1.*`, `IPLIKE(ipAddr, '10.0.0.*')`
+| Service shorthand | `isICMP`, `isHTTP | isHTTPS`, `notisSNMP`
+| Category shorthand | `catincProduction`, `catincLinux & catincRouters`
+| Columns | Any visible column from database-schema.xml
+|===
+
+Comparison operators such as `>`, `<`, `>=`, and `<=` are not supported in filter rules.
 
 For LIKE comparisons, the character "_" matches any single character and "%" matches any series of characters (or none at all).
 For example, "F_o%"" matches "Foo", "Foom", and "Flowers" but not "Foip".
