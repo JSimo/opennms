@@ -38,7 +38,6 @@ import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.TreeSet;
-import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import javax.annotation.PreDestroy;
@@ -50,6 +49,7 @@ import org.opennms.netmgt.config.api.DatabaseSchemaConfig;
 import org.opennms.netmgt.config.filter.Table;
 import org.opennms.netmgt.filter.api.FilterDao;
 import org.opennms.netmgt.filter.api.FilterParseException;
+import org.opennms.netmgt.filter.ast.FilterRuleParser;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.InitializingBean;
@@ -69,12 +69,6 @@ import com.codahale.metrics.Timer;
  */
 public class JdbcFilterDao implements FilterDao, InitializingBean {
     private static final Logger LOG = LoggerFactory.getLogger(JdbcFilterDao.class);
-    private static final Pattern SQL_KEYWORD_PATTERN = Pattern.compile("\\s+(?:AND|OR|(?:NOT )?(?:LIKE|IN)|IS (?:NOT )?DISTINCT FROM)\\s+|(?:\\s+IS (?:NOT )?NULL|::(?:TIMESTAMP|INET))(?!\\w)|(?<!\\w)(?:NOT\\s+|IPLIKE(?=\\())", Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE);
-    private static final Pattern SQL_QUOTE_PATTERN = Pattern.compile("'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"");
-	private static final Pattern SQL_ESCAPED_PATTERN = Pattern.compile("###@(\\d+)@###");
-	private static final Pattern SQL_VALUE_COLUMN_PATTERN = Pattern.compile("[a-zA-Z0-9_\\-]*[a-zA-Z][a-zA-Z0-9_\\-]*");
-	private static final Pattern SQL_IPLIKE_PATTERN = Pattern.compile("(\\w+)\\s+IPLIKE\\s+([0-9a-f.:*,-]+|###@\\d+@###)", Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE);
-	private static final String SQL_IPLIKE6_RHS_REGEX = "^[0-9A-Fa-f:*,-]+$";
 
 	private DataSource m_dataSource;
     private DatabaseSchemaConfig m_databaseSchemaConfigFactory;
@@ -326,7 +320,12 @@ public class JdbcFilterDao implements FilterDao, InitializingBean {
             	}
             }
             if (filterByAddress) {
-                sqlString += " AND ipInterface.ipaddr = ?";
+                // Restrict primary table by ipaddr in a subquery so the planner applies the filter before
+                // joining to assets/node, avoiding a full-table join on larger OpenNMS instances.
+                final String primaryTableName = m_databaseSchemaConfigFactory.getPrimaryTable().getName();
+                final String fromPrimary = "FROM " + primaryTableName + " ";
+                final String fromSubquery = "FROM (SELECT * FROM " + primaryTableName + " WHERE ipaddr = ?) " + primaryTableName + " ";
+                sqlString = sqlString.replaceFirst(Pattern.quote(fromPrimary), fromSubquery);
             }
 
             conn = getDataSource().getConnection();
@@ -565,150 +564,33 @@ public class JdbcFilterDao implements FilterDao, InitializingBean {
     }
 
     /**
-     * SQL Key Word regex
+     * Parse a filter rule into a SQL WHERE clause using the AST pipeline
+     * (tokenizer → parser → optimizer → SQL emitter).
+     * <p>
+     * Supported grammar (filter rules are not arbitrary SQL):
+     * <ul>
+     *   <li>Boolean: {@code &}, {@code |}, {@code !} (also {@code &&}, {@code ||})</li>
+     *   <li>Comparisons: {@code ==}, {@code !=}, {@code LIKE}, {@code NOT LIKE}</li>
+     *   <li>Null checks: {@code IS NULL}, {@code IS NOT NULL}</li>
+     *   <li>Distinct: {@code IS DISTINCT FROM}, {@code IS NOT DISTINCT FROM}</li>
+     *   <li>Membership: {@code IN (...)}, {@code NOT IN (...)}</li>
+     *   <li>Type casts: {@code ::TIMESTAMP}, {@code ::INET} on column references</li>
+     *   <li>{@code IPLIKE} as operator or function</li>
+     *   <li>Shorthands: {@code isSERVICE}, {@code notisSERVICE}, {@code catincCATEGORY}</li>
+     *   <li>Columns from database-schema.xml (case-insensitive)</li>
+     * </ul>
+     * Identifiers starting with {@code is} are treated as service shorthands (same as legacy regex).
+     * Optimizers may rewrite equivalent expressions into more efficient SQL (e.g. merged catinc terms).
      *
-     * Binary Logic / Operators - \\s+(?:AND|OR|(?:NOT )?(?:LIKE|IN)|IS (?:NOT )?DISTINCT FROM)\\s+
-     * Unary Operators - \\s+IS (?:NOT )?NULL(?!\\w)
-     * Typecasts - ::(?:TIMESTAMP|INET)(?!\\w)
-     * Unary Logic - (?&lt;!\\w)NOT\\s+
-     * Functions - (?&lt;!\\w)IPLIKE(?=\\()
-     *
-     */
-
-    /**
-     * Generic method to parse and translate a rule into SQL.
-     *
-     * Only columns listed in database-schema.xml may be used in a filter
-     * (explicit "table.column" specification is not supported in filters)
-     *
-     * To differentiate column names from SQL key words (operators, functions, typecasts, etc)
-     * SQL_KEYWORD_REGEX must match any SQL key words that may be used in filters,
-     * and must not match any column names or prefixed values
-     *
-     * To make filter syntax more simple and intuitive than SQL
-     * - Filters support some aliases for common SQL key words / operators
-     *    "&amp;" or "&amp;&amp;" = "AND"
-     *    "|" or "||" = "OR"
-     *    "!" = "NOT"
-     *    "==" = "="
-     * - "IPLIKE" may be used as an operator instead of a function in filters ("ipAddr IPLIKE '*.*.*.*'")
-     *   When using "IPLIKE" as an operator, the value does not have to be quoted ("ipAddr IPLIKE *.*.*.*" is ok)
-     * - Some common SQL expressions may be generated by adding a (lower-case) prefix to an unquoted value in the filter
-     *    "isVALUE" = "serviceName = VALUE"
-     *    "notisVALUE" = interface does not support the specified service
-     *    "catincVALUE" = node is in the specified category
-     * - Double-quoted (") strings in filters are converted to single-quoted (') strings in SQL
-     *   SQL treats single-quoted strings as constants (values) and double-quoted strings as identifiers (columns, tables, etc)
-     *   So, all quoted strings in filters are treated as constants, and filters don't support quoted identifiers
-     *
-     * This function does not do complete syntax/grammar checking - that is left to the database itself - do not assume the output is valid SQL
-     *
-     * @param tables
-     *            a list to be populated with any tables referenced by the returned SQL
-     * @param rule
-     *            the rule to parse
-     *
-     * @return an SQL WHERE clause
-     *
-     * @throws FilterParseException
-     *             if any errors occur during parsing
+     * @param tables list populated with tables referenced by the rule
+     * @param rule   filter rule string
+     * @return SQL WHERE clause including the {@code WHERE} keyword, or empty string
+     * @throws FilterParseException if the rule is invalid or uses an unknown column
      */
     private String parseRule(final List<Table> tables, final String rule) throws FilterParseException {
         if (rule != null && rule.length() > 0) {
-        	final List<String> extractedStrings = new ArrayList<>();
-        	
-        	String sqlRule = rule;
-
-            // Extract quoted strings from rule and convert double-quoted strings to single-quoted strings
-            // Quoted strings need to be extracted first to avoid accidentally matching/modifying anything within them
-            // As in SQL, pairs of quotes within a quoted string are treated as an escaped quote character:
-            //  'a''b' = a'b ; "a""b" = a"b ; 'a"b' = a"b ; "a'b" = a'b
-        	Matcher regex = SQL_QUOTE_PATTERN.matcher(sqlRule);
-            StringBuffer tempStringBuff = new StringBuffer();
-            while (regex.find()) {
-            	final String tempString = regex.group();
-                if (tempString.charAt(0) == '"') {
-                    extractedStrings.add("'" + tempString.substring(1, tempString.length() - 1).replaceAll("\"\"", "\"").replaceAll("'", "''") + "'");
-                } else {
-                    extractedStrings.add(regex.group());
-                }
-                regex.appendReplacement(tempStringBuff, "###@" + (extractedStrings.size() - 1) + "@###");
-            }
-            final int tempIndex = tempStringBuff.length();
-            regex.appendTail(tempStringBuff);
-            if (tempStringBuff.substring(tempIndex).indexOf('\'') > -1) {
-                final String message = "Unmatched ' in filter rule '" + rule + "'";
-				LOG.error(message);
-                throw new FilterParseException(message);
-            }
-            if (tempStringBuff.substring(tempIndex).indexOf('"') > -1) {
-                final String message = "Unmatched \" in filter rule '" + rule + "'";
-				LOG.error(message);
-                throw new FilterParseException(message);
-            }
-            sqlRule = tempStringBuff.toString();
-
-            // Translate filter-specific operators to SQL operators
-            sqlRule = sqlRule.replaceAll("\\s*(?:&|&&)\\s*", " AND ");
-            sqlRule = sqlRule.replaceAll("\\s*(?:\\||\\|\\|)\\s*", " OR ");
-            sqlRule = sqlRule.replaceAll("\\s*!(?!=)\\s*", " NOT ");
-            sqlRule = sqlRule.replaceAll("==", "=");
-
-            // Translate IPLIKE operators to IPLIKE() functions
-            // If IPLIKE is already used as a function in the filter, this regex should not match it
-            regex = SQL_IPLIKE_PATTERN.matcher(sqlRule);
-            tempStringBuff = new StringBuffer();
-            while (regex.find()) {
-                // Is the second argument already a quoted string?
-                if (regex.group().charAt(0) == '#') {
-                    regex.appendReplacement(tempStringBuff, "IPLIKE($1, $2)");
-                } else {
-                    regex.appendReplacement(tempStringBuff, "IPLIKE($1, '$2')");
-                }
-            }
-            regex.appendTail(tempStringBuff);
-            sqlRule = tempStringBuff.toString();
-
-            // Extract SQL key words to avoid identifying them as columns or prefixed values
-            regex = SQL_KEYWORD_PATTERN.matcher(sqlRule);
-            tempStringBuff = new StringBuffer();
-            while (regex.find()) {
-                extractedStrings.add(regex.group().toUpperCase());
-                regex.appendReplacement(tempStringBuff, "###@" + (extractedStrings.size() - 1) + "@###");
-            }
-            regex.appendTail(tempStringBuff);
-            sqlRule = tempStringBuff.toString();
-
-            // Identify prefixed values and columns
-            regex = SQL_VALUE_COLUMN_PATTERN.matcher(sqlRule);
-            tempStringBuff = new StringBuffer();
-            while (regex.find()) {
-                // Convert prefixed values to SQL expressions
-                if (regex.group().startsWith("is")) {
-                    regex.appendReplacement(tempStringBuff, m_databaseSchemaConfigFactory.addColumn(tables, "serviceName") + " = '" + regex.group().substring(2) + "'");
-                } else if (regex.group().startsWith("notis")) {
-                    regex.appendReplacement(tempStringBuff, m_databaseSchemaConfigFactory.addColumn(tables, "ipAddr") + " NOT IN (SELECT ifServices.ipAddr FROM ifServices, service WHERE service.serviceName ='" + regex.group().substring(5) + "' AND service.serviceID = ifServices.serviceID)");
-                } else if (regex.group().startsWith("catinc")) {
-                    regex.appendReplacement(tempStringBuff, m_databaseSchemaConfigFactory.addColumn(tables, "nodeID") + " IN (SELECT category_node.nodeID FROM category_node, categories WHERE categories.categoryID = category_node.categoryID AND categories.categoryName = '" + regex.group().substring(6) + "')");
-                } else if (regex.group().matches(SQL_IPLIKE6_RHS_REGEX)) {
-                    // Do nothing, it's apparently an IPv6 IPLIKE expression right-hand side
-                } else {
-                    // Call m_databaseSchemaConfigFactory.addColumn() on each column
-                    regex.appendReplacement(tempStringBuff, m_databaseSchemaConfigFactory.addColumn(tables, regex.group()));
-                }
-            }
-            regex.appendTail(tempStringBuff);
-            sqlRule = tempStringBuff.toString();
-
-            // Merge extracted strings back into expression
-            regex = SQL_ESCAPED_PATTERN.matcher(sqlRule);
-            tempStringBuff = new StringBuffer();
-            while (regex.find()) {
-                regex.appendReplacement(tempStringBuff, Matcher.quoteReplacement(extractedStrings.get(Integer.parseInt(regex.group(1)))));
-            }
-            regex.appendTail(tempStringBuff);
-            sqlRule = tempStringBuff.toString();
-            return "WHERE " + sqlRule;
+            String whereBody = FilterRuleParser.parseWhereBody(tables, rule, m_databaseSchemaConfigFactory);
+            return whereBody.isEmpty() ? "" : "WHERE " + whereBody;
         }
         return "";
     }
